@@ -4,7 +4,7 @@ This public repository contains the technical files required by Strata's
 automatic updater. It does not contain the launcher source code.
 
 Players should download Strata from
-[`ProjectStrata/launcher`](https://github.com/ProjectStrata/launcher/releases/latest).
+[`Cx188/strata`](https://github.com/Cx188/strata/releases/latest).
 
 ## Why are there extra release files?
 
