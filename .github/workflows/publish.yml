@@ -1,0 +1,201 @@
+name: Publish automatic-update feed
+
+on:
+  push:
+    branches: [main]
+    paths: [release-request.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: strata-automatic-update-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.request.outputs.version }}
+      tag: ${{ steps.request.outputs.tag }}
+      source_sha: ${{ steps.request.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read and validate release request
+        id: request
+        shell: bash
+        run: |
+          VERSION="$(jq -r '.version' release-request.json)"
+          TAG="$(jq -r '.tag' release-request.json)"
+          SOURCE_SHA="$(jq -r '.sourceSha' release-request.json)"
+
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$TAG" == "v$VERSION" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out private source revision
+        uses: actions/checkout@v4
+        with:
+          repository: Cx188/strata-luncher
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          ssh-key: ${{ secrets.STRATA_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - run: npm ci
+        working-directory: source
+
+      - name: Apply release version
+        run: node scripts/set-release-version.mjs --version "${{ needs.prepare.outputs.version }}"
+        working-directory: source
+
+      - run: npm run typecheck
+        working-directory: source
+
+      - run: npm run lint
+        working-directory: source
+
+      - run: npm run test
+        working-directory: source
+
+      - name: Build installers and update metadata
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-vite build && npx electron-builder --${{ matrix.platform }} --publish never
+        working-directory: source
+
+      - name: Collect technical release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            source/release/Strata-Windows-Setup-*.exe
+            source/release/Strata-Windows-Setup-*.exe.blockmap
+            source/release/Strata-macOS-Universal-*.dmg
+            source/release/Strata-macOS-Universal-*.zip
+            source/release/Strata-macOS-Universal-*.zip.blockmap
+            source/release/Strata-Linux-x86_64-*.AppImage
+            source/release/latest*.yml
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Check out public metadata from the private source revision
+        uses: actions/checkout@v4
+        with:
+          repository: Cx188/strata-luncher
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          ssh-key: ${{ secrets.STRATA_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source-metadata
+
+      - name: Publish technical update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ProjectStrata/launcher-updates
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          cat > release-notes.md <<EOF
+          ## Automatic-update feed
+
+          These files are consumed by installed Strata launchers. Players should
+          use the clean three-file download page:
+          https://github.com/ProjectStrata/launcher/releases/tag/$RELEASE_TAG
+
+          Source revision: \`$SOURCE_SHA\`.
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "Strata $RELEASE_VERSION update feed" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --target "$GITHUB_SHA" \
+              --title "Strata $RELEASE_VERSION update feed" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+
+      - name: Request clean player release
+        env:
+          DISTRIBUTION_DEPLOY_KEY: ${{ secrets.STRATA_DISTRIBUTION_DEPLOY_KEY }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          KEY_FILE="$RUNNER_TEMP/strata-distribution-key"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DISTRIBUTION_DEPLOY_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+
+          git clone git@github.com:ProjectStrata/launcher.git distribution
+          mkdir -p distribution/assets
+          cp source-metadata/install.ps1 distribution/install.ps1
+          cp source-metadata/install.sh distribution/install.sh
+          cp source-metadata/news.json distribution/news.json
+          cp source-metadata/src/main/icon.png distribution/assets/strata.png
+          if [ -f source-metadata/extensions.json ]; then
+            cp source-metadata/extensions.json distribution/extensions.json
+          fi
+
+          jq -n \
+            --arg version "$RELEASE_VERSION" \
+            --arg tag "$RELEASE_TAG" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg requestedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version: $version, tag: $tag, sourceSha: $sourceSha, requestedAt: $requestedAt}' \
+            > distribution/release-request.json
+
+          git -C distribution config user.name "Strata Release Bot"
+          git -C distribution config user.email "119851863+Cx188@users.noreply.github.com"
+          git -C distribution add \
+            release-request.json \
+            install.ps1 \
+            install.sh \
+            news.json \
+            extensions.json \
+            assets/strata.png
+          git -C distribution commit -m "release: request $RELEASE_TAG"
+          git -C distribution push origin main

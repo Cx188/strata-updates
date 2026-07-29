@@ -1,2 +1,19 @@
-# launcher-updates
-Technical automatic-update feed for Strata Launcher
+# Strata automatic-update feed
+
+This public repository contains the technical files required by Strata's
+automatic updater. It does not contain the launcher source code.
+
+Players should download Strata from
+[`ProjectStrata/launcher`](https://github.com/ProjectStrata/launcher/releases/latest).
+
+## Why are there extra release files?
+
+- `latest*.yml` tells an installed launcher which version and package to use,
+  including its cryptographic checksum.
+- `*.blockmap` describes package blocks so Strata can download only changed
+  portions when differential updates are supported.
+- The macOS ZIP is the package format used by Electron's macOS updater.
+
+Deleting these files would break or significantly degrade automatic updates.
+They live here so the player-facing release page can contain only the Windows,
+macOS, and Linux installers.
