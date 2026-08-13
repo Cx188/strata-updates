@@ -1,13 +1,18 @@
 name: Publish automatic-update feed
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - release-request.json
+      - .github/workflows/publish.yml
   push:
     branches: [main]
     paths: [release-request.json]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: strata-automatic-update-release
@@ -16,12 +21,15 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.request.outputs.version }}
       tag: ${{ steps.request.outputs.tag }}
       source_sha: ${{ steps.request.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Read and validate release request
         id: request
@@ -40,7 +48,10 @@ jobs:
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
   build:
+    if: github.event_name != 'pull_request'
     needs: prepare
+    environment: production-release
+    timeout-minutes: 45
     strategy:
       # Preserve results from the other operating systems when one runner has
       # an infrastructure or CDN failure.
@@ -56,7 +67,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out private source revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Cx188/strata-luncher
           ref: ${{ needs.prepare.outputs.source_sha }}
@@ -64,7 +75,7 @@ jobs:
           persist-credentials: false
           path: source
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -96,7 +107,7 @@ jobs:
         working-directory: source
 
       - name: Collect technical release files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.platform }}
           if-no-files-found: error
@@ -111,23 +122,82 @@ jobs:
             source/release/latest*.yml
 
   publish:
+    if: github.event_name != 'pull_request'
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    environment: production-release
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: release
           merge-multiple: true
 
       - name: Check out public metadata from the private source revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Cx188/strata-luncher
           ref: ${{ needs.prepare.outputs.source_sha }}
           ssh-key: ${{ secrets.STRATA_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source-metadata
+
+      - name: Create signed release manifest and checksums
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          UPDATE_SIGNING_KEY: ${{ secrets.STRATA_UPDATE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$UPDATE_SIGNING_KEY"
+          WINDOWS="release/Strata-Windows-Setup-$RELEASE_VERSION.exe"
+          MACOS="release/Strata-macOS-Universal-$RELEASE_VERSION.zip"
+          LINUX="release/Strata-Linux-x86_64-$RELEASE_VERSION.AppImage"
+          test -f "$WINDOWS" && test -f "$MACOS" && test -f "$LINUX"
+
+          asset_json() {
+            local file="$1"
+            jq -n \
+              --arg name "$(basename "$file")" \
+              --arg sha512 "$(openssl dgst -sha512 -binary "$file" | openssl base64 -A)" \
+              --argjson size "$(stat -c '%s' "$file")" \
+              '{name: $name, sha512: $sha512, size: $size}'
+          }
+
+          jq -n \
+            --arg version "$RELEASE_VERSION" \
+            --arg tag "$RELEASE_TAG" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg issuedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson win32 "$(asset_json "$WINDOWS")" \
+            --argjson darwin "$(asset_json "$MACOS")" \
+            --argjson linux "$(asset_json "$LINUX")" \
+            '{schemaVersion: 1, version: $version, tag: $tag, sourceSha: $sourceSha, issuedAt: $issuedAt, assets: {win32: $win32, darwin: $darwin, linux: $linux}}' \
+            > release/strata-release.json
+
+          KEY_FILE="$RUNNER_TEMP/strata-update-signing-key.pem"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          openssl pkeyutl -sign -rawin -inkey "$KEY_FILE" \
+            -in release/strata-release.json -out release/strata-release.sig
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey <(openssl pkey -in "$KEY_FILE" -pubout) \
+            -in release/strata-release.json -sigfile release/strata-release.sig
+          (cd release && sha256sum * > SHA256SUMS)
+
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release/*
 
       - name: Publish technical update release
         env:
@@ -153,22 +223,21 @@ jobs:
           $NEWS_BODY
           EOF
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --title "Strata $RELEASE_VERSION update feed" \
-              --notes-file release-notes.md \
-              --latest
-          else
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
+              --draft \
               --target "$GITHUB_SHA" \
               --title "Strata $RELEASE_VERSION update feed" \
-              --notes-file release-notes.md \
-              --latest
+              --notes-file release-notes.md
+          elif [[ "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .draft)" != "true" ]]; then
+            echo "Release $RELEASE_TAG is already published and immutable."
+            exit 0
           fi
 
           for asset in release/*; do
             gh release upload "$RELEASE_TAG" "$asset" --clobber
           done
+          gh release edit "$RELEASE_TAG" --draft=false --latest
 
       - name: Request clean player release
         env:
@@ -178,10 +247,14 @@ jobs:
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           KEY_FILE="$RUNNER_TEMP/strata-distribution-key"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          test -n "$DISTRIBUTION_DEPLOY_KEY"
           install -m 700 -d "$HOME/.ssh"
           printf '%s\n' "$DISTRIBUTION_DEPLOY_KEY" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
-          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://api.github.com/meta \
+            | jq -r '.ssh_keys[] | "github.com " + .' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
           export GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
 
           git clone git@github.com:Cx188/strata.git distribution
