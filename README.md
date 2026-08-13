@@ -17,3 +17,13 @@ Players should download Strata from
 Deleting these files would break or significantly degrade automatic updates.
 They live here so the player-facing release page can contain only the Windows,
 macOS, and Linux installers.
+
+## Release integrity
+
+New releases also include:
+
+- `strata-release.json` and `strata-release.sig`, an Ed25519-signed manifest that installed launchers verify before accepting an update;
+- `SHA256SUMS`, covering every technical release asset;
+- GitHub artifact attestations that link each binary to this repository's protected release workflow.
+
+Release jobs are gated by the `production-release` environment, all reusable Actions are pinned to immutable commit SHAs, and published releases are immutable. Workflow changes must be reviewed before the protected `main` branch accepts them.
