@@ -136,8 +136,9 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          NEWS_TITLE="$(jq -r '.[0].title // "Strata update"' source-metadata/news.json)"
-          NEWS_BODY="$(jq -r '.[0].body // "This release includes launcher improvements and fixes."' source-metadata/news.json)"
+          NEWS_JSON="$(curl --fail --silent --show-error --max-time 15 https://api.stratamc.net/v1/news || printf '[]')"
+          NEWS_TITLE="$(jq -r '.[0].title // "Strata update"' <<<"$NEWS_JSON")"
+          NEWS_BODY="$(jq -r '.[0].body // "This release includes launcher improvements and fixes."' <<<"$NEWS_JSON")"
           cat > release-notes.md <<EOF
           ## What's new
 
@@ -178,7 +179,6 @@ jobs:
           mkdir -p distribution/assets
           cp source-metadata/install.ps1 distribution/install.ps1
           cp source-metadata/install.sh distribution/install.sh
-          cp source-metadata/news.json distribution/news.json
           cp source-metadata/src/main/icon.png distribution/assets/strata.png
           jq -n \
             --arg version "$RELEASE_VERSION" \
@@ -194,7 +194,6 @@ jobs:
             release-request.json \
             install.ps1 \
             install.sh \
-            news.json \
             assets/strata.png
           git -C distribution commit -m "release: request $RELEASE_TAG"
           git -C distribution push origin main
