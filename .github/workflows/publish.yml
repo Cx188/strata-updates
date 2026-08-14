@@ -9,7 +9,6 @@ on:
   push:
     branches: [main]
     paths: [release-request.json]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -73,7 +72,16 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_sha }}
           ssh-key: ${{ secrets.STRATA_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
+          fetch-depth: 0
           path: source
+
+      - name: Require source revision from private main
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -193,6 +201,11 @@ jobs:
             -inkey <(openssl pkey -in "$KEY_FILE" -pubout) \
             -in release/strata-release.json -sigfile release/strata-release.sig
           (cd release && sha256sum * > SHA256SUMS)
+          openssl pkeyutl -sign -rawin -inkey "$KEY_FILE" \
+            -in release/SHA256SUMS -out release/SHA256SUMS.sig
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey <(openssl pkey -in "$KEY_FILE" -pubout) \
+            -in release/SHA256SUMS -sigfile release/SHA256SUMS.sig
 
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -209,7 +222,7 @@ jobs:
           NEWS_JSON="$(curl --fail --silent --show-error \
             --retry 3 --retry-all-errors --connect-timeout 5 --max-time 20 \
             --user-agent 'Strata-Release/1.0 (+https://stratamc.net)' \
-            https://api.stratamc.net/v1/news || printf '[]')"
+            "https://api.stratamc.net/v1/news?release=$RELEASE_VERSION" || printf '[]')"
           NEWS_BODY="$(jq -r '
             if length == 0 then
               "### Strata update\n\nThis release includes launcher improvements and fixes."
